@@ -1,119 +1,260 @@
+//go:build windows
+// +build windows
+
 package injgo
 
 import (
 	"errors"
+	"path/filepath"
+	"syscall"
 	"unsafe"
 
 	"go.zoe.im/injgo/pkg/w32"
 )
 
+// Platform-specific errors
 var (
-	ErrAlreadyInjected = errors.New("dll already injected")
-	ErrModuleNotExits  = errors.New("can't found module")
-	ErrModuleSnapshot  = errors.New("create module snapshot failed")
+	ErrCreateSnapshot = errors.New("failed to create process snapshot")
+	ErrModuleSnapshot = errors.New("failed to create module snapshot")
+	ErrModuleNotFound = errors.New("module not found in process")
 )
 
-// WARNING: only 386 arch works well.
-//
-// Inject is the function inject dynamic library to a process
-//
-// In windows, name is a file with dll extion.If the file
-// name exits, we will return error.
-// The workflow of injection in windows is:
-// 0. load kernel32.dll in current process.
-// 1. open target process T.
-// 2. malloc memory in T to store the name of the library.
-// 3. get address of function LoadLibraryA from kernel32.dll
-//    in T.
-// 4. call CreateRemoteThread method in kernel32.dll to execute
-//    LoadLibraryA in T.
-func Inject(pid int, dllname string, replace bool) error {
-
-	// check is already injected
-	if !replace && IsInjected(pid, dllname) {
-		return ErrAlreadyInjected
-	}
-
-	// open process
-	hdlr, err := w32.OpenProcess(w32.PROCESS_ALL_ACCESS, false, uint32(pid))
+// findProcessByName finds a process by name (Windows implementation)
+func findProcessByName(name string) (*Process, error) {
+	handle, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
-		return err
+		return nil, ErrCreateSnapshot
 	}
-	defer w32.CloseHandle(hdlr)
+	defer syscall.CloseHandle(handle)
 
-	// malloc space to write dll name
-	dlllen := len(dllname)
-	dllnameaddr, err := w32.VirtualAllocEx(hdlr, 0, dlllen, w32.MEM_COMMIT, w32.PAGE_EXECUTE_READWRITE)
+	var entry syscall.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+
+	err = syscall.Process32First(handle, &entry)
 	if err != nil {
-		return err
+		return nil, ErrProcessNotFound
 	}
 
-	// write dll name
-	err = w32.WriteProcessMemory(hdlr, uint32(dllnameaddr), []byte(dllname), uint(dlllen))
-	if err != nil {
-		return err
+	for {
+		exeFile := w32.UTF16PtrToString(&entry.ExeFile[0])
+		if exeFile == name || filepath.Base(exeFile) == name {
+			return &Process{
+				PID:     int(entry.ProcessID),
+				Name:    exeFile,
+				ExePath: exeFile, // TODO: get full path
+			}, nil
+		}
+
+		err = syscall.Process32Next(handle, &entry)
+		if err != nil {
+			break
+		}
 	}
 
-	// test
-	tecase, _ := w32.ReadProcessMemory(hdlr, uint32(dllnameaddr), uint(dlllen))
-	if string(tecase) != dllname {
-		return errors.New("write dll name error")
-	}
-
-	// get LoadLibraryA address in target process
-	// TODO: can we get the address at from this process?
-	lddladdr, err := w32.GetProcAddress(w32.GetModuleHandleA("kernel32.dll"), "LoadLibraryA")
-	if err != nil {
-		return err
-	}
-
-	// call remote process
-	dllthread, _, err := w32.CreateRemoteThread(hdlr, nil, 0, uint32(lddladdr), dllnameaddr, 0)
-	if err != nil {
-		return err
-	}
-
-	w32.CloseHandle(dllthread)
-
-	return nil
+	return nil, ErrProcessNotFound
 }
 
-// InjectByProcessName inject dll by process name
-func InjectByProcessName(name string, dll string, replace bool) error {
-	p, err := FindProcessByName(name)
+// findProcessByPID opens a process by PID (Windows implementation)
+func findProcessByPID(pid int) (*Process, error) {
+	handle, err := syscall.OpenProcess(syscall.PROCESS_QUERY_INFORMATION, false, uint32(pid))
 	if err != nil {
-		return err
+		return nil, ErrProcessNotFound
 	}
-	return Inject(p.ProcessID, dll, replace)
+	syscall.CloseHandle(handle)
+
+	// Get process name
+	name := ""
+	snapshot, _ := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
+	if snapshot != 0 {
+		defer syscall.CloseHandle(snapshot)
+		var entry syscall.ProcessEntry32
+		entry.Size = uint32(unsafe.Sizeof(entry))
+		syscall.Process32First(snapshot, &entry)
+		for {
+			if int(entry.ProcessID) == pid {
+				name = w32.UTF16PtrToString(&entry.ExeFile[0])
+				break
+			}
+			if syscall.Process32Next(snapshot, &entry) != nil {
+				break
+			}
+		}
+	}
+
+	return &Process{
+		PID:  pid,
+		Name: name,
+	}, nil
 }
 
-// FindModuleEntry find module entry of with dll name
-func FindModuleEntry(pid int, dllname string) (*w32.MODULEENTRY32, error) {
-	hdlr := w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPMODULE, uint32(pid))
-	defer w32.CloseHandle(hdlr)
-
-	if hdlr == 0 {
-		return nil, ErrModuleSnapshot
+// findAllProcessesByName finds all processes matching the name
+func findAllProcessesByName(name string) ([]*Process, error) {
+	handle, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil, ErrCreateSnapshot
 	}
+	defer syscall.CloseHandle(handle)
+
+	var processes []*Process
+	var entry syscall.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+
+	err = syscall.Process32First(handle, &entry)
+	if err != nil {
+		return processes, nil
+	}
+
+	for {
+		exeFile := w32.UTF16PtrToString(&entry.ExeFile[0])
+		if name == "" || exeFile == name || filepath.Base(exeFile) == name {
+			processes = append(processes, &Process{
+				PID:     int(entry.ProcessID),
+				Name:    exeFile,
+				ExePath: exeFile,
+			})
+		}
+
+		err = syscall.Process32Next(handle, &entry)
+		if err != nil {
+			break
+		}
+	}
+
+	return processes, nil
+}
+
+// isInjected checks if a DLL is loaded in the process
+func isInjected(pid int, lib string) (bool, error) {
+	dllName := filepath.Base(lib)
+
+	handle := w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPMODULE|w32.TH32CS_SNAPMODULE32, uint32(pid))
+	if handle == 0 {
+		return false, nil // Can't check, assume not injected
+	}
+	defer w32.CloseHandle(handle)
 
 	var entry w32.MODULEENTRY32
 	entry.Size = uint32(unsafe.Sizeof(entry))
 
-	next := w32.Module32First(hdlr, &entry)
-
-	for next {
-		if w32.UTF16PtrToString(&entry.SzExePath[0]) == dllname {
-			return &entry, nil
-		}
-
-		next = w32.Module32Next(hdlr, &entry)
+	if !w32.Module32First(handle, &entry) {
+		return false, nil
 	}
 
-	return nil, ErrModuleNotExits
+	for {
+		moduleName := w32.UTF16PtrToString(&entry.SzModule[0])
+		if moduleName == dllName {
+			return true, nil
+		}
+		if !w32.Module32Next(handle, &entry) {
+			break
+		}
+	}
+
+	return false, nil
 }
 
-// IsInjected check is dll is already injected
-func IsInjected(pid int, dllname string) bool {
-	_, err := FindModuleEntry(pid, dllname)
-	return err == nil
+// inject loads a DLL into the target process
+func inject(pid int, lib string) error {
+	// Get absolute path
+	absPath, err := filepath.Abs(lib)
+	if err != nil {
+		return ErrLibraryNotFound
+	}
+
+	// Open process
+	handle, err := w32.OpenProcess(w32.PROCESS_ALL_ACCESS, false, uint32(pid))
+	if err != nil {
+		return err
+	}
+	defer w32.CloseHandle(handle)
+
+	// Allocate memory for DLL path
+	pathLen := len(absPath) + 1
+	remoteAddr, err := w32.VirtualAllocEx(handle, 0, pathLen, w32.MEM_COMMIT, w32.PAGE_EXECUTE_READWRITE)
+	if err != nil {
+		return err
+	}
+
+	// Write DLL path
+	err = w32.WriteProcessMemory(handle, uint32(remoteAddr), []byte(absPath), uint(pathLen))
+	if err != nil {
+		return err
+	}
+
+	// Get LoadLibraryA address
+	kernel32 := w32.GetModuleHandleA("kernel32.dll")
+	loadLibAddr, err := w32.GetProcAddress(kernel32, "LoadLibraryA")
+	if err != nil {
+		return err
+	}
+
+	// Create remote thread
+	threadHandle, _, err := w32.CreateRemoteThread(handle, nil, 0, uint32(loadLibAddr), remoteAddr, 0)
+	if err != nil {
+		return err
+	}
+	defer w32.CloseHandle(threadHandle)
+
+	// Wait for completion (with timeout)
+	w32.WaitForSingleObject(threadHandle, 5000)
+
+	return nil
+}
+
+// eject unloads a DLL from the target process
+func eject(pid int, lib string) error {
+	dllName := filepath.Base(lib)
+
+	// Find module handle
+	handle := w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPMODULE|w32.TH32CS_SNAPMODULE32, uint32(pid))
+	if handle == 0 {
+		return ErrModuleSnapshot
+	}
+	defer w32.CloseHandle(handle)
+
+	var entry w32.MODULEENTRY32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	var moduleHandle uintptr
+
+	if w32.Module32First(handle, &entry) {
+		for {
+			moduleName := w32.UTF16PtrToString(&entry.SzModule[0])
+			if moduleName == dllName {
+				moduleHandle = uintptr(unsafe.Pointer(entry.ModBaseAddr))
+				break
+			}
+			if !w32.Module32Next(handle, &entry) {
+				break
+			}
+		}
+	}
+
+	if moduleHandle == 0 {
+		return ErrModuleNotFound
+	}
+
+	// Open process
+	procHandle, err := w32.OpenProcess(w32.PROCESS_ALL_ACCESS, false, uint32(pid))
+	if err != nil {
+		return err
+	}
+	defer w32.CloseHandle(procHandle)
+
+	// Get FreeLibrary address
+	kernel32 := w32.GetModuleHandleA("kernel32.dll")
+	freeLibAddr, err := w32.GetProcAddress(kernel32, "FreeLibrary")
+	if err != nil {
+		return err
+	}
+
+	// Create remote thread to call FreeLibrary
+	threadHandle, _, err := w32.CreateRemoteThread(procHandle, nil, 0, uint32(freeLibAddr), moduleHandle, 0)
+	if err != nil {
+		return err
+	}
+	defer w32.CloseHandle(threadHandle)
+
+	w32.WaitForSingleObject(threadHandle, 5000)
+
+	return nil
 }

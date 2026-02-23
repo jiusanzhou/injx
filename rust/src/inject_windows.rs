@@ -1,145 +1,276 @@
-use std::io;
-use std::mem::{self, MaybeUninit};
-use std::ptr::null_mut;
+//! Windows DLL injection implementation
+//!
+//! Uses CreateRemoteThread + LoadLibraryW technique.
+
+use std::mem;
 use std::path::Path;
+use std::ptr::null_mut;
 
-use crate::utils::*;
+use crate::error::{Error, Result};
+use crate::inject::Injector;
+use crate::process_windows::Process;
+use crate::utils::to_wide_string;
 use crate::winapi::*;
-use crate::process_windows::*;
 
-// https://gist.github.com/sum-catnip/00491d030f69918e96369ce900b24d52
+impl Injector for Process {
+    fn is_injected(&self, dll: &str) -> Result<bool> {
+        // Get module name from path
+        let dll_name = Path::new(dll)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(dll)
+            .to_lowercase();
 
-// open the process
-// call remote thread
+        // Enumerate modules
+        let handle = unsafe { 
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, self.pid()) 
+        };
+        
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            // Access denied or process not accessible
+            return Ok(false);
+        }
 
-pub trait InjectorExt {
-    fn is_injected(&self, dll: &str) -> Result<bool, io::Error>;
-    fn inject(&self, dll: &str) -> Result<(), io::Error>;
-    fn eject(&self, dll: &str) -> Result<(), io::Error>;
-}
+        let mut entry: MODULEENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = mem::size_of::<MODULEENTRY32>() as u32;
 
-impl InjectorExt for Process {
+        let mut found = false;
+        
+        if unsafe { Module32First(handle, &mut entry) } != 0 {
+            loop {
+                let module_name = char_to_string(&entry.szModule).to_lowercase();
+                if module_name.contains(&dll_name) || dll_name.contains(&module_name) {
+                    found = true;
+                    break;
+                }
+                
+                if unsafe { Module32Next(handle, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
 
-    fn is_injected(&self, dll: &str) -> Result<bool, io::Error> {
-        todo!()
+        unsafe { CloseHandle(handle) };
+        Ok(found)
     }
 
-    fn inject(&self, dll: &str) -> Result<(), io::Error> {
-        // make sure dll exits
-        let fullpath = Path::new(dll).canonicalize();
-        if fullpath.is_err() {
-            return Err(fullpath.unwrap_err());
-        }
-        let fullpath = fullpath.unwrap();
-        let dll = fullpath.to_str().unwrap();
+    fn inject(&self, dll: &str) -> Result<()> {
+        // Resolve full path
+        let fullpath = Path::new(dll)
+            .canonicalize()
+            .map_err(|e| Error::library_not_found(format!("{}: {}", dll, e)))?;
+        
+        let dll_path = fullpath
+            .to_str()
+            .ok_or_else(|| Error::invalid_argument("invalid path encoding"))?;
 
-        let path_wstr = to_wide_string(dll);
+        // Convert to wide string
+        let path_wstr = to_wide_string(dll_path);
+        let path_len = path_wstr.len() * 2;
 
-        // length from wide string and add the last \0
-        let path_len = path_wstr.len() * 2 + 1;
+        // Allocate memory in target process
+        let remote_path = unsafe {
+            VirtualAllocEx(
+                self.handle(),
+                null_mut(),
+                path_len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
 
-        // alloc memorry in the process to store dll path name
-        let r_path_addr = unsafe{VirtualAllocEx(self.handle, null_mut(), path_len,
-            MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)};
-
-        // check if the addr is null
-        if r_path_addr.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "alloc memorry failed"));
-        }
-
-        // write dll path to the remote
-        let r = unsafe{WriteProcessMemory(self.handle, r_path_addr,
-            path_wstr.as_ptr() as _, path_len, null_mut())};
-
-        // check written result
-        if r == FALSE {
-            return Err(io::Error::new(io::ErrorKind::Other, "write data to memorry failed"));
-        }
-
-        // get method address from process
-        let r_func_addr = unsafe{GetProcAddress(
-            GetModuleHandleA("kernel32.dll\0".as_ptr() as _),
-            "LoadLibraryW\0".as_ptr() as _,
-        )};
-
-        // check if the addr is null
-        if r_func_addr.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "get load func memorry failed"));
+        if remote_path.is_null() {
+            return Err(Error::platform(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                "failed to allocate memory in target process",
+            ));
         }
 
-        // create remote thread to call load library
-        let t_handle = unsafe{CreateRemoteThread(
-            self.handle,
-            null_mut(),
-            0,
-            Some(mem::transmute(r_func_addr)),
-            r_path_addr,
-            0,
-            null_mut()
-        )};
-        if t_handle.is_null() {
-            println!("create remote thread failed");
-            return Err(get_last_error());
+        // Write DLL path to target process
+        let written = unsafe {
+            WriteProcessMemory(
+                self.handle(),
+                remote_path,
+                path_wstr.as_ptr() as _,
+                path_len,
+                null_mut(),
+            )
+        };
+
+        if written == FALSE {
+            unsafe { VirtualFreeEx(self.handle(), remote_path, 0, MEM_RELEASE) };
+            return Err(Error::platform(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                "failed to write path to target memory",
+            ));
         }
 
-        // wait for thread
-        let r = unsafe{WaitForSingleObject(t_handle, 100)}; // INFINITE
-        if r == WAIT_FAILED {
-            // println!("==== wait for single object");
-            return Err(get_last_error());
+        // Get LoadLibraryW address
+        let load_library = unsafe {
+            GetProcAddress(
+                GetModuleHandleA("kernel32.dll\0".as_ptr() as _),
+                "LoadLibraryW\0".as_ptr() as _,
+            )
+        };
+
+        if load_library.is_null() {
+            unsafe { VirtualFreeEx(self.handle(), remote_path, 0, MEM_RELEASE) };
+            return Err(Error::platform(0, "failed to get LoadLibraryW address"));
         }
 
-        // // try to get exit code of thread
-        // let mut v = MaybeUninit::uninit();
-        // let r = unsafe {GetExitCodeThread(t_handle, v.as_mut_ptr())};
-        // if r == FALSE {
-        //     return Err(get_last_error());
-        // }
-        // let v = unsafe {v.assume_init()};
+        // Create remote thread to call LoadLibraryW
+        let thread = unsafe {
+            CreateRemoteThread(
+                self.handle(),
+                null_mut(),
+                0,
+                Some(mem::transmute(load_library)),
+                remote_path,
+                0,
+                null_mut(),
+            )
+        };
 
-        // release the r_path_addr
-        unsafe{VirtualFreeEx(self.handle, r_path_addr, 1, MEM_DECOMMIT)};
+        if thread.is_null() {
+            unsafe { VirtualFreeEx(self.handle(), remote_path, 0, MEM_RELEASE) };
+            return Err(Error::from_win32());
+        }
 
-        // close the thread handle
-        unsafe{CloseHandle(t_handle)};
+        // Wait for thread completion
+        let wait_result = unsafe { WaitForSingleObject(thread, 5000) }; // 5 second timeout
+        
+        if wait_result == WAIT_FAILED {
+            unsafe {
+                CloseHandle(thread);
+                VirtualFreeEx(self.handle(), remote_path, 0, MEM_RELEASE);
+            }
+            return Err(Error::from_win32());
+        }
+
+        // Get thread exit code (LoadLibrary return value)
+        let mut exit_code: u32 = 0;
+        unsafe {
+            GetExitCodeThread(thread, &mut exit_code as *mut _ as _);
+            CloseHandle(thread);
+            VirtualFreeEx(self.handle(), remote_path, 0, MEM_RELEASE);
+        }
+
+        // exit_code == 0 means LoadLibrary failed
+        if exit_code == 0 {
+            return Err(Error::platform(0, "LoadLibrary returned NULL - DLL load failed"));
+        }
 
         Ok(())
     }
 
-    fn eject(&self, dll: &str) -> Result<(), io::Error> {
-        todo!()
+    fn eject(&self, dll: &str) -> Result<()> {
+        // Get module name from path
+        let dll_name = Path::new(dll)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(dll)
+            .to_lowercase();
+
+        // Find module handle
+        let handle = unsafe { 
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, self.pid()) 
+        };
+        
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(Error::from_win32());
+        }
+
+        let mut entry: MODULEENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = mem::size_of::<MODULEENTRY32>() as u32;
+
+        let mut module_handle: Option<HMODULE> = None;
+        
+        if unsafe { Module32First(handle, &mut entry) } != 0 {
+            loop {
+                let module_name = char_to_string(&entry.szModule).to_lowercase();
+                if module_name.contains(&dll_name) || dll_name.contains(&module_name) {
+                    module_handle = Some(entry.hModule);
+                    break;
+                }
+                
+                if unsafe { Module32Next(handle, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+
+        unsafe { CloseHandle(handle) };
+
+        let hmodule = module_handle
+            .ok_or_else(|| Error::library_not_found(format!("{} not loaded", dll)))?;
+
+        // Get FreeLibrary address
+        let free_library = unsafe {
+            GetProcAddress(
+                GetModuleHandleA("kernel32.dll\0".as_ptr() as _),
+                "FreeLibrary\0".as_ptr() as _,
+            )
+        };
+
+        if free_library.is_null() {
+            return Err(Error::platform(0, "failed to get FreeLibrary address"));
+        }
+
+        // Create remote thread to call FreeLibrary
+        let thread = unsafe {
+            CreateRemoteThread(
+                self.handle(),
+                null_mut(),
+                0,
+                Some(mem::transmute(free_library)),
+                hmodule as _,
+                0,
+                null_mut(),
+            )
+        };
+
+        if thread.is_null() {
+            return Err(Error::from_win32());
+        }
+
+        // Wait for completion
+        unsafe {
+            WaitForSingleObject(thread, 5000);
+            CloseHandle(thread);
+        }
+
+        Ok(())
     }
+}
+
+/// Convert C char array to String
+fn char_to_string(chars: &[i8]) -> String {
+    chars.iter()
+        .map(|c| *c as u8 as char)
+        .collect::<String>()
+        .trim_end_matches('\0')
+        .to_string()
+}
+
+// Additional Windows-specific constants
+const TH32CS_SNAPMODULE: u32 = 0x00000008;
+const TH32CS_SNAPMODULE32: u32 = 0x00000010;
+
+// Module32First/Next bindings
+#[link(name = "kernel32")]
+extern "system" {
+    fn Module32First(hSnapshot: HANDLE, lpme: *mut MODULEENTRY32) -> i32;
+    fn Module32Next(hSnapshot: HANDLE, lpme: *mut MODULEENTRY32) -> i32;
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::process_windows::*;
-    use super::InjectorExt;
-    use std::path::Path;
-    use std::fs;
+    use super::*;
 
     #[test]
-    fn test_path() {
-        println!("{:?}", ::std::env::current_dir().unwrap());
-        // target/i686-pc-windows-msvc/release/example.dll
-        let path = Path::new("./example").canonicalize().unwrap();
-        for entry in fs::read_dir(path).unwrap() {
-            println!("===> {:?}", entry.unwrap());
-        }
-    }
-
-    #[test]
-    fn inject_example() {
-        use crate::evelate_windows::*;
-
-        let _ = evelate_privileges();
-
-        println!("Hello injector!");
-        let p = Process::find_first_by_name("WeChat.exe").unwrap();
-        let r = p.inject("./example/target/i686-pc-windows-msvc/release/example.dll");
-        match r {
-            Err(e) => println!("inject error: {}", e),
-            Ok(_) => println!("inject success"),
-        }
+    fn test_inject_api() {
+        // This test requires a running process and DLL
+        // Just verify the API compiles
+        println!("Inject API test - compile check only");
     }
 }

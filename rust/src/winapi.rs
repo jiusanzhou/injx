@@ -1,87 +1,51 @@
+//! Windows API bindings
+//!
+//! Re-exports commonly used Windows API types and functions.
 
-pub use winapi::shared::ntdef::{
-    HANDLE,
-    NULL,
-};
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(dead_code)]
 
 pub use winapi::shared::minwindef::{
-    FALSE,
-    TRUE,
-    MAX_PATH,
-    DWORD,
-    HMODULE
+    DWORD, FALSE, HMODULE, MAX_PATH, TRUE,
+};
+
+pub use winapi::shared::ntdef::{HANDLE, NULL};
+
+pub use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+
+pub use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+
+pub use winapi::um::memoryapi::{
+    ReadProcessMemory, VirtualAllocEx, VirtualFreeEx, WriteProcessMemory,
 };
 
 pub use winapi::um::processthreadsapi::{
-    GetProcessId,
-    GetCurrentProcess,
-    OpenProcess,
-    OpenProcessToken,
-    CreateRemoteThread,
-    GetExitCodeThread
+    CreateRemoteThread, GetCurrentProcess, GetExitCodeThread, GetProcessId,
+    OpenProcess, OpenProcessToken,
 };
 
-pub use winapi::um::handleapi::{
-    CloseHandle,
-    INVALID_HANDLE_VALUE
-};
+pub use winapi::um::psapi::{GetModuleBaseNameW, GetModuleFileNameExW};
+
+pub use winapi::um::securitybaseapi::AdjustTokenPrivileges;
+
+pub use winapi::um::synchapi::WaitForSingleObject;
 
 pub use winapi::um::tlhelp32::{
-    CreateToolhelp32Snapshot,
-    Process32Next,
+    CreateToolhelp32Snapshot, Process32Next, MODULEENTRY32, PROCESSENTRY32,
     TH32CS_SNAPPROCESS,
-    PROCESSENTRY32, MODULEENTRY32,
-};
-
-pub use winapi::um::psapi::{
-    GetModuleBaseNameW,
-    GetModuleFileNameExW
-};
-
-pub use winapi::um::winnt::{
-    PROCESS_ALL_ACCESS,
-    MEM_COMMIT,
-    MEM_DECOMMIT,
-    MEM_RELEASE,
-    MEM_RESERVE,
-    PAGE_READWRITE,
-    PAGE_EXECUTE_READWRITE,
-    TOKEN_PRIVILEGES,
-    TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_QUERY,
-    SE_PRIVILEGE_ENABLED,
-    SE_DEBUG_NAME,
-    LUID_AND_ATTRIBUTES
-};
-
-pub use winapi::um::memoryapi::{
-    ReadProcessMemory,
-    WriteProcessMemory,
-    VirtualAllocEx,
-    VirtualFreeEx,
-};
-
-pub use winapi::um::libloaderapi::{
-    GetModuleHandleA,
-    GetProcAddress
-};
-
-pub use winapi::um::synchapi::{
-    WaitForSingleObject
-};
-
-pub use winapi::um::wow64apiset::{
-    IsWow64Process
 };
 
 pub use winapi::um::winbase::{
-    INFINITE,
+    LookupPrivilegeValueA, CREATE_NEW_CONSOLE, CREATE_SUSPENDED, INFINITE,
     WAIT_FAILED,
-    LookupPrivilegeValueA,
-    CREATE_SUSPENDED,
-    CREATE_NEW_CONSOLE
 };
 
-pub use winapi::um::securitybaseapi::{
-    AdjustTokenPrivileges
+pub use winapi::um::winnt::{
+    LUID_AND_ATTRIBUTES, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE,
+    PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PROCESS_ALL_ACCESS,
+    SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
+
+pub use winapi::um::wow64apiset::IsWow64Process;

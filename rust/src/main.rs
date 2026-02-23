@@ -1,72 +1,147 @@
+//! injx CLI - Cross-platform dynamic library injection tool
+//!
+//! Usage:
+//!   injx <PROCESS_NAME|PID> <LIBRARY>...
 
-use injrs::process_windows::*;
-use injrs::inject_windows::*;
-use injrs::evelate_windows::*;
+use std::env;
+use std::process::exit;
 
-const USAGE_HELP: &str = "
+use injx::{Injector, Process};
+
+#[cfg(target_os = "windows")]
+use injx::elevate_privileges;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const USAGE: &str = r#"
 USAGE:
-injrs PROCESS_NAME/PID [Libraies...]
+    injx <PROCESS_NAME|PID> <LIBRARY>...
 
 EXAMPLES:
-1. Inject test.dll to process Calc.exe
-    $ injrs Calc.exe test.dll
+    # Windows - Inject DLL into Notepad
+    injx notepad.exe payload.dll
 
-2. Inject test.dll and demo.dll to process with PID: 1888
-    $ injrs 1888 test.dll demo.dll
-";
+    # macOS - Inject dylib into Safari (requires root)
+    sudo injx Safari payload.dylib
+
+    # Linux - Inject .so into target process
+    sudo injx target_app payload.so
+
+    # Inject multiple libraries by PID
+    injx 1234 lib1.dll lib2.dll
+
+NOTES:
+    - Windows: Requires same architecture (x86/x64) as target
+    - macOS:   Requires root or taskgated entitlement
+    - Linux:   Requires CAP_SYS_PTRACE or root
+"#;
 
 fn main() {
-    println!("Welcome to have injrs. A library injector written by Rust.");
-    // load args
-    let mut args = std::env::args();
-    if args.len() < 2 {
-        println!("{}", USAGE_HELP);
-        return
-    }
-    let pid_or_name = args.nth(1).expect("must give a process name or pid");
-    let dlls: Vec<String> = std::env::args().skip(2).collect();
-    if dlls.len() == 0 {
-        println!("You at least give one file to inject");
-        return
+    println!("injx v{} - Cross-platform library injection", VERSION);
+
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 3 {
+        println!("{}", USAGE);
+        exit(1);
     }
 
-    let process: Process;
-    match pid_or_name.parse::<u32>() {
+    let target = &args[1];
+    let libraries: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
+
+    if libraries.is_empty() {
+        eprintln!("Error: At least one library path required");
+        exit(1);
+    }
+
+    // Elevate privileges on Windows
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = elevate_privileges() {
+            eprintln!("Warning: Failed to elevate privileges: {}", e);
+        }
+    }
+
+    // macOS root check
+    #[cfg(target_os = "macos")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Warning: Not running as root - task_for_pid may fail");
+            eprintln!("         Try: sudo injx {} ...", target);
+        }
+    }
+
+    // Linux ptrace check
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Warning: Not running as root - ptrace may fail");
+            eprintln!("         Try: sudo injx {} ...", target);
+            eprintln!("         Or: sudo setcap cap_sys_ptrace=ep $(which injx)");
+        }
+    }
+
+    // Find or open process
+    let process = match target.parse::<u32>() {
         Ok(pid) => {
-            // process pid
-            match Process::from_pid(pid) {
-                None => {
-                    println!("can't find process with pid: {}", pid);
-                    return
-                },
-                Some(p) => process = p
-            }
-        },
+            println!("Target: PID {}", pid);
+            Process::from_pid(pid)
+        }
         Err(_) => {
-            let name = pid_or_name.as_str();
-            // process name
-            match Process::find_first_by_name(name) {
-                None => {
-                    println!("can't find process with name: {}", name);
-                    return
-                },
-                Some(p) => process = p
-            }
+            println!("Target: {}", target);
+            Process::find_by_name(target)
         }
-    }
+    };
 
-    let _ = evelate_privileges();
+    let process = match process {
+        Some(p) => {
+            println!("Found: {} (PID: {})", p.name(), p.pid());
+            p
+        }
+        None => {
+            eprintln!("Error: Process not found: {}", target);
+            exit(1);
+        }
+    };
 
-    for i in dlls {
-        print!("{} => ", i);
-        match process.inject(i.as_str()) {
+    // Inject each library
+    let mut success_count = 0;
+    let mut failed_count = 0;
+
+    println!();
+    for lib in &libraries {
+        print!("  {} ... ", lib);
+
+        // Check if already injected
+        match process.is_injected(lib) {
+            Ok(true) => {
+                println!("⚠ already injected");
+                success_count += 1;
+                continue;
+            }
+            Ok(false) => {}
             Err(e) => {
-                println!("error: {}", e);
-            },
+                eprintln!("⚠ check failed: {}", e);
+            }
+        }
+
+        // Inject
+        match process.inject(lib) {
             Ok(_) => {
-                println!("success");
+                println!("✓ success");
+                success_count += 1;
+            }
+            Err(e) => {
+                println!("✗ failed: {}", e);
+                failed_count += 1;
             }
         }
     }
 
+    println!();
+    println!("Results: {} success, {} failed", success_count, failed_count);
+
+    if failed_count > 0 {
+        exit(1);
+    }
 }
