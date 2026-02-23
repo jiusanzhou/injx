@@ -78,7 +78,7 @@ cargo install --path rust
 ### Go
 
 ```bash
-go get go.zoe.im/injgo
+go get go.zoe.im/injx
 ```
 
 ## Usage
