@@ -1,6 +1,6 @@
 <div align="center">
 
-# `jinx`
+# `injx`
 
 **Cross-language DLL/dylib injection toolkit**
 
@@ -12,7 +12,7 @@
 
 ## Overview
 
-**Jinx** is a cross-language dynamic library injection toolkit. It provides both CLI tools and libraries for injecting DLLs (Windows) / dylibs (macOS) / shared objects (Linux) into running processes.
+**Injx** is a cross-language dynamic library injection toolkit. It provides both CLI tools and libraries for injecting DLLs (Windows) / dylibs (macOS) / shared objects (Linux) into running processes.
 
 ## Features
 
@@ -24,7 +24,7 @@
 ## Project Structure
 
 ```
-jinx/
+injx/
 ├── go/           # Go implementation (from injgo)
 ├── rust/         # Rust implementation (from injrs)
 ├── examples/     # Example DLLs for testing
@@ -39,15 +39,15 @@ jinx/
 ```bash
 cd rust
 cargo build --release
-./target/release/jinx <PROCESS_NAME|PID> <DLL_PATH>
+./target/release/injx <PROCESS_NAME|PID> <DLL_PATH>
 ```
 
 ### Go
 
 ```bash
 cd go
-go build -o jinx ./cmd/injgo
-./jinx <PROCESS_NAME|PID> <DLL_PATH>
+go build -o injx ./cmd/injgo
+./injx <PROCESS_NAME|PID> <DLL_PATH>
 ```
 
 ## Platform Support
@@ -65,17 +65,17 @@ go build -o jinx ./cmd/injgo
 
 ```bash
 # Using Rust
-jinx Calc.exe test.dll
+injx Calc.exe test.dll
 
 # Using Go
-jinx Calculator.exe test.dll
+injx Calculator.exe test.dll
 ```
 
 ### As Library (Rust)
 
 ```rust
-use jinx::process::Process;
-use jinx::inject::InjectorExt;
+use injx::process::Process;
+use injx::inject::InjectorExt;
 
 let process = Process::find_first_by_name("target.exe").unwrap();
 process.inject("./payload.dll").unwrap();
@@ -84,9 +84,9 @@ process.inject("./payload.dll").unwrap();
 ### As Library (Go)
 
 ```go
-import "go.zoe.im/jinx"
+import "go.zoe.im/injx"
 
-err := jinx.InjectByProcessName("target.exe", "./payload.dll", false)
+err := injx.InjectByProcessName("target.exe", "./payload.dll", false)
 ```
 
 ## Building

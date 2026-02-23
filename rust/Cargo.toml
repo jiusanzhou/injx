@@ -1,5 +1,5 @@
 [package]
-name = "jinx"
+name = "injx"
 version = "0.2.0"
 description = "Cross-language DLL/dylib injection toolkit. 跨语言动态库注入工具包。"
 authors = ["Zoe <hi@zoe.im>"]
